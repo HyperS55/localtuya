@@ -191,6 +191,8 @@
                     "color_mode": "Color Mode DP",
                     "color_temp_min_kelvin": "Min Color Temperature (K)",
                     "color_temp_max_kelvin": "Max Color Temperature (K)",
+                    "color_temp_min_value": "Min Color Temperature (raw DP value)",
+                    "color_temp_max_value": "Max Color Temperature (raw DP value)",
                     "music_mode": "Music Mode",
                     "scene": "Scene DP",
                     "fan_speed_control": "Fan Speed Control DP",
