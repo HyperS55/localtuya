@@ -168,11 +168,11 @@ def flow_schema(dps):
         # This maps warm 2700K -> DP 1000 and cold 6500K -> DP 0.
         #
         # OLD CODE: no separate raw CCT DP range existed here.
-        vol.Optional(CONF_COLOR_TEMP_MIN_VALUE): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=10000)
+        vol.Optional(CONF_COLOR_TEMP_MIN_VALUE, default=DEFAULT_COLOR_TEMP_MIN_VALUE): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=1000)
         ),
-        vol.Optional(CONF_COLOR_TEMP_MAX_VALUE): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=10000)
+        vol.Optional(CONF_COLOR_TEMP_MAX_VALUE, default=DEFAULT_COLOR_TEMP_MAX_VALUE): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=1000)
         ),
         vol.Optional(
             CONF_COLOR_TEMP_REVERSE,
