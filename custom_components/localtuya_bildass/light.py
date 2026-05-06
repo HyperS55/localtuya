@@ -52,8 +52,8 @@ DEFAULT_MAX_KELVIN = 6500  # MIRED 153
 # PATCH: Keep old default behavior unless raw DP value range is configured.
 # If not set, color_temp_min_value defaults to color_temp_min_kelvin and
 # color_temp_max_value defaults to color_temp_max_kelvin.
-DEFAULT_COLOR_TEMP_MIN_VALUE = None
-DEFAULT_COLOR_TEMP_MAX_VALUE = None
+DEFAULT_COLOR_TEMP_MIN_VALUE = DEFAULT_MIN_KELVIN
+DEFAULT_COLOR_TEMP_MAX_VALUE = DEFAULT_MAX_KELVIN
 
 DEFAULT_COLOR_TEMP_REVERSE = False
 DEFAULT_LOWER_BRIGHTNESS = 29
@@ -133,10 +133,15 @@ MAP_MODE_SET = {0: Mode(), 1: Mode(color=MODE_MANUAL)}
 
 def map_range(value, from_lower, from_upper, to_lower, to_upper):
     """Map a value in one range to another."""
+    if from_lower == from_upper:
+        return round(to_lower)
+
     mapped = (value - from_lower) * (to_upper - to_lower) / (
         from_upper - from_lower
     ) + to_lower
-    return round(min(max(mapped, to_lower), to_upper))
+    clamp_lower = min(to_lower, to_upper)
+    clamp_upper = max(to_lower, to_upper)
+    return round(min(max(mapped, clamp_lower), clamp_upper))
 
 
 def flow_schema(dps):
@@ -169,10 +174,10 @@ def flow_schema(dps):
         #
         # OLD CODE: no separate raw CCT DP range existed here.
         vol.Optional(CONF_COLOR_TEMP_MIN_VALUE, default=DEFAULT_COLOR_TEMP_MIN_VALUE): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=1000)
+            vol.Coerce(int), vol.Range(min=0, max=8000)
         ),
         vol.Optional(CONF_COLOR_TEMP_MAX_VALUE, default=DEFAULT_COLOR_TEMP_MAX_VALUE): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=1000)
+            vol.Coerce(int), vol.Range(min=0, max=8000)
         ),
         vol.Optional(
             CONF_COLOR_TEMP_REVERSE,
@@ -291,17 +296,18 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
             return None
 
         dp_value = int(dp_value)
+        lower_color_temp, upper_color_temp = self._effective_color_temp_range()
 
         # Avoid division by zero if user configured equal min/max raw values.
-        if self._lower_color_temp == self._upper_color_temp:
+        if lower_color_temp == upper_color_temp:
             return self._max_mired
 
         # color_temp_min_value maps to warm/min Kelvin = max mired.
         # color_temp_max_value maps to cold/max Kelvin = min mired.
         return map_range(
             dp_value,
-            self._lower_color_temp,
-            self._upper_color_temp,
+            lower_color_temp,
+            upper_color_temp,
             self._max_mired,
             self._min_mired,
         )
@@ -317,9 +323,11 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         elif mired > self._max_mired:
             mired = self._max_mired
 
+        lower_color_temp, upper_color_temp = self._effective_color_temp_range()
+
         # Avoid division by zero if user configured equal Kelvin/mired range.
         if self._min_mired == self._max_mired:
-            return self._lower_color_temp
+            return lower_color_temp
 
         # HA mired range is inverted versus Kelvin:
         #   cold/high Kelvin -> low mired
@@ -331,9 +339,15 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
             mired,
             self._max_mired,
             self._min_mired,
-            self._lower_color_temp,
-            self._upper_color_temp,
+            lower_color_temp,
+            upper_color_temp,
         )
+
+    def _effective_color_temp_range(self):
+        """Return the raw Tuya CCT range after applying legacy reverse mode."""
+        if self._color_temp_reverse:
+            return self._upper_color_temp, self._lower_color_temp
+        return self._lower_color_temp, self._upper_color_temp
 
     @property
     def color_temp(self):
