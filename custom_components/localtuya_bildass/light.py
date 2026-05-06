@@ -1,4 +1,15 @@
-"""Platform to locally control Tuya-based light devices."""
+"""Platform to locally control Tuya-based light devices.
+
+PATCHED: Adds explicit raw Tuya DP scaling for color temperature.
+
+This version is based on Bildass/localtuya `custom_components/localtuya_bildass/light.py`
+and keeps the old CCT logic commented near the changed sections for reference.
+
+Required companion change in const.py:
+    CONF_COLOR_TEMP_MIN_VALUE = "color_temp_min_value"
+    CONF_COLOR_TEMP_MAX_VALUE = "color_temp_max_value"
+"""
+
 import logging
 import textwrap
 from dataclasses import dataclass
@@ -25,8 +36,12 @@ from .const import (
     CONF_COLOR_MODE,
     CONF_COLOR_TEMP_MAX_KELVIN,
     CONF_COLOR_TEMP_MIN_KELVIN,
+    # PATCH: new raw Tuya DP value range fields for CCT scaling.
+    CONF_COLOR_TEMP_MIN_VALUE,
+    CONF_COLOR_TEMP_MAX_VALUE,
     CONF_COLOR_TEMP_REVERSE,
-    CONF_MUSIC_MODE, CONF_COLOR_MODE_SET,
+    CONF_MUSIC_MODE,
+    CONF_COLOR_MODE_SET,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,8 +49,13 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_MIN_KELVIN = 2700  # MIRED 370
 DEFAULT_MAX_KELVIN = 6500  # MIRED 153
 
-DEFAULT_COLOR_TEMP_REVERSE = False
+# PATCH: Keep old default behavior unless raw DP value range is configured.
+# If not set, color_temp_min_value defaults to color_temp_min_kelvin and
+# color_temp_max_value defaults to color_temp_max_kelvin.
+DEFAULT_COLOR_TEMP_MIN_VALUE = None
+DEFAULT_COLOR_TEMP_MAX_VALUE = None
 
+DEFAULT_COLOR_TEMP_REVERSE = False
 DEFAULT_LOWER_BRIGHTNESS = 29
 DEFAULT_UPPER_BRIGHTNESS = 1000
 
@@ -92,6 +112,7 @@ SCENE_LIST_RGB_1000 = {
     + "0000000",
 }
 
+
 @dataclass(frozen=True)
 class Mode:
     color: str = MODE_COLOR
@@ -105,6 +126,7 @@ class Mode:
     def as_dict(self) -> dict[str, str]:
         default = {"Default": self.white}
         return {**default, "Mode Color": self.color, "Mode Scene": self.scene}
+
 
 MAP_MODE_SET = {0: Mode(), 1: Mode(color=MODE_MANUAL)}
 
@@ -135,6 +157,22 @@ def flow_schema(dps):
         ),
         vol.Optional(CONF_COLOR_TEMP_MAX_KELVIN, default=DEFAULT_MAX_KELVIN): vol.All(
             vol.Coerce(int), vol.Range(min=1500, max=8000)
+        ),
+        # PATCH: New optional raw DP-value range for CCT.
+        # These two values represent the exact integer values sent to the Tuya DP.
+        # Example for the LEDVANCE lamp discussed:
+        #   color_temp_min_kelvin: 2700
+        #   color_temp_max_kelvin: 6500
+        #   color_temp_min_value: 1000
+        #   color_temp_max_value: 0
+        # This maps warm 2700K -> DP 1000 and cold 6500K -> DP 0.
+        #
+        # OLD CODE: no separate raw CCT DP range existed here.
+        vol.Optional(CONF_COLOR_TEMP_MIN_VALUE): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=10000)
+        ),
+        vol.Optional(CONF_COLOR_TEMP_MAX_VALUE): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=10000)
         ),
         vol.Optional(
             CONF_COLOR_TEMP_REVERSE,
@@ -169,7 +207,25 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         self._upper_brightness = self._config.get(
             CONF_BRIGHTNESS_UPPER, DEFAULT_UPPER_BRIGHTNESS
         )
-        self._upper_color_temp = self._upper_brightness
+
+        # PATCH: CCT now has its own raw Tuya DP range.
+        # OLD CODE:
+        #     self._upper_color_temp = self._upper_brightness
+        # That coupled color temperature scaling to brightness scaling, which breaks
+        # devices where CCT has a different DP range, such as 0..1000 or 1000..0.
+        self._min_kelvin = self._config.get(
+            CONF_COLOR_TEMP_MIN_KELVIN, DEFAULT_MIN_KELVIN
+        )
+        self._max_kelvin = self._config.get(
+            CONF_COLOR_TEMP_MAX_KELVIN, DEFAULT_MAX_KELVIN
+        )
+        self._lower_color_temp = self._config.get(
+            CONF_COLOR_TEMP_MIN_VALUE, self._min_kelvin
+        )
+        self._upper_color_temp = self._config.get(
+            CONF_COLOR_TEMP_MAX_VALUE, self._max_kelvin
+        )
+
         self._max_mired = color_util.color_temperature_kelvin_to_mired(
             self._config.get(CONF_COLOR_TEMP_MIN_KELVIN, DEFAULT_MIN_KELVIN)
         )
@@ -207,7 +263,11 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         """Return the brightness of the light."""
         if self.is_color_mode or self.is_white_mode:
             return map_range(
-                self._brightness, self._lower_brightness, self._upper_brightness, 0, 255
+                self._brightness,
+                self._lower_brightness,
+                self._upper_brightness,
+                0,
+                255,
             )
         return None
 
@@ -217,28 +277,84 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         if self.is_color_mode:
             return self._hs
         if (
-                ColorMode.HS in self.supported_color_modes
-                and not ColorMode.COLOR_TEMP in self.supported_color_modes
+            ColorMode.HS in self.supported_color_modes
+            and not ColorMode.COLOR_TEMP in self.supported_color_modes
         ):
             return [0, 0]
         return None
+
+    # PATCH: helper converts raw Tuya CCT DP value -> HA mired.
+    # This is needed for reading device state back into Home Assistant.
+    def _dp_value_to_mired(self, dp_value):
+        """Convert raw Tuya color-temp DP value to Home Assistant mired."""
+        if dp_value is None:
+            return None
+
+        dp_value = int(dp_value)
+
+        # Avoid division by zero if user configured equal min/max raw values.
+        if self._lower_color_temp == self._upper_color_temp:
+            return self._max_mired
+
+        # color_temp_min_value maps to warm/min Kelvin = max mired.
+        # color_temp_max_value maps to cold/max Kelvin = min mired.
+        return map_range(
+            dp_value,
+            self._lower_color_temp,
+            self._upper_color_temp,
+            self._max_mired,
+            self._min_mired,
+        )
+
+    # PATCH: helper converts HA mired -> raw Tuya CCT DP value.
+    # This is needed when Home Assistant sends a color-temperature command.
+    def _mired_to_dp_value(self, mired):
+        """Convert Home Assistant mired color-temp value to raw Tuya DP value."""
+        mired = int(mired)
+
+        if mired < self._min_mired:
+            mired = self._min_mired
+        elif mired > self._max_mired:
+            mired = self._max_mired
+
+        # Avoid division by zero if user configured equal Kelvin/mired range.
+        if self._min_mired == self._max_mired:
+            return self._lower_color_temp
+
+        # HA mired range is inverted versus Kelvin:
+        #   cold/high Kelvin -> low mired
+        #   warm/low Kelvin  -> high mired
+        # Config semantics:
+        #   color_temp_min_value belongs to color_temp_min_kelvin (warm)
+        #   color_temp_max_value belongs to color_temp_max_kelvin (cold)
+        return map_range(
+            mired,
+            self._max_mired,
+            self._min_mired,
+            self._lower_color_temp,
+            self._upper_color_temp,
+        )
 
     @property
     def color_temp(self):
         """Return the color_temp of the light."""
         if self.has_config(CONF_COLOR_TEMP) and self.is_white_mode:
-            color_temp_value = (
-                self._upper_color_temp - self._color_temp
-                if self._color_temp_reverse
-                else self._color_temp
-            )
-            return int(
-                self._max_mired
-                - (
-                    ((self._max_mired - self._min_mired) / self._upper_color_temp)
-                    * color_temp_value
-                )
-            )
+            # PATCH: use explicit raw DP range mapping.
+            return self._dp_value_to_mired(self._color_temp)
+
+            # OLD CODE kept for reference:
+            # color_temp_value = (
+            #     self._upper_color_temp - self._color_temp
+            #     if self._color_temp_reverse
+            #     else self._color_temp
+            # )
+            # return int(
+            #     self._max_mired
+            #     - (
+            #         ((self._max_mired - self._min_mired) / self._upper_color_temp)
+            #         * color_temp_value
+            #     )
+            # )
         return None
 
     @property
@@ -271,18 +387,14 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
     def supported_color_modes(self) -> set[ColorMode] | set[str] | None:
         """Flag supported color modes."""
         color_modes: set[ColorMode] = set()
-
         if self.has_config(CONF_COLOR_TEMP):
             color_modes.add(ColorMode.COLOR_TEMP)
         if self.has_config(CONF_COLOR):
             color_modes.add(ColorMode.HS)
-
         if not color_modes and self.has_config(CONF_BRIGHTNESS):
             return {ColorMode.BRIGHTNESS}
-
         if not color_modes:
             return {ColorMode.ONOFF}
-
         return color_modes
 
     @property
@@ -298,14 +410,12 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         """Return the color_mode of the light."""
         if len(self.supported_color_modes) == 1:
             return next(iter(self.supported_color_modes))
-
         if self.is_color_mode:
             return ColorMode.HS
         if self.is_white_mode:
             return ColorMode.COLOR_TEMP
         if self._brightness:
             return ColorMode.BRIGHTNESS
-
         return ColorMode.ONOFF
 
     @property
@@ -353,8 +463,10 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         states = {}
         if not self.is_on:
             states[self._dp_id] = True
+
         features = self.supported_features
         brightness = None
+
         if ATTR_EFFECT in kwargs and (features & LightEntityFeature.EFFECT):
             scene = self._scenes.get(kwargs[ATTR_EFFECT])
             if scene is not None:
@@ -432,21 +544,35 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         if ColorMode.COLOR_TEMP in kwargs and ColorMode.COLOR_TEMP in self.supported_color_modes:
             if brightness is None:
                 brightness = self._brightness
+
+            # PATCH: convert HA mired value to raw Tuya DP value with explicit
+            # color_temp_min_value/color_temp_max_value mapping.
             mired = int(kwargs[ColorMode.COLOR_TEMP])
-            if self._color_temp_reverse:
-                mired = self._max_mired - (mired - self._min_mired)
-            if mired < self._min_mired:
-                mired = self._min_mired
-            elif mired > self._max_mired:
-                mired = self._max_mired
-            color_temp = int(
-                self._upper_color_temp
-                - (self._upper_color_temp / (self._max_mired - self._min_mired))
-                * (mired - self._min_mired)
-            )
-            states[self._config.get(CONF_COLOR_MODE)] = MODE_WHITE
-            states[self._config.get(CONF_BRIGHTNESS)] = brightness
+            color_temp = self._mired_to_dp_value(mired)
+
+            # OLD CODE kept for reference:
+            # mired = int(kwargs[ColorMode.COLOR_TEMP])
+            # if self._color_temp_reverse:
+            #     mired = self._max_mired - (mired - self._min_mired)
+            # if mired < self._min_mired:
+            #     mired = self._min_mired
+            # elif mired > self._max_mired:
+            #     mired = self._max_mired
+            # color_temp = int(
+            #     self._upper_color_temp
+            #     - (self._upper_color_temp / (self._max_mired - self._min_mired))
+            #     * (mired - self._min_mired)
+            # )
+
+            # PATCH: guard these writes so a CCT-only device without explicit mode or
+            # brightness config does not write None as a DP id.
+            if self.has_config(CONF_COLOR_MODE):
+                states[self._config.get(CONF_COLOR_MODE)] = MODE_WHITE
+            if self.has_config(CONF_BRIGHTNESS) and brightness is not None:
+                states[self._config.get(CONF_BRIGHTNESS)] = brightness
+
             states[self._config.get(CONF_COLOR_TEMP)] = color_temp
+
         # Optimistic update - změň stav okamžitě
         if not self.is_on:
             self._state = True
@@ -464,7 +590,6 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         # Optimistic update - změň stav okamžitě
         self._state = False
         self.schedule_update_ha_state()
-
         await self._device.set_dp(False, self._dp_id)
 
     def status_updated(self):
@@ -473,7 +598,8 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         supported = self.supported_features
         self._effect = None
 
-        if (ColorMode.BRIGHTNESS in self.supported_color_modes
+        if (
+            ColorMode.BRIGHTNESS in self.supported_color_modes
             or self.has_config(CONF_BRIGHTNESS)
             or self.has_config(CONF_COLOR)
         ):
@@ -510,11 +636,11 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
                 self._effect = self.__find_scene_by_scene_data(
                     self.dps_conf(CONF_SCENE)
                 )
-                if self._effect == SCENE_CUSTOM:
-                    if SCENE_CUSTOM not in self._effect_list:
-                        self._effect_list.append(SCENE_CUSTOM)
-                elif SCENE_CUSTOM in self._effect_list:
-                    self._effect_list.remove(SCENE_CUSTOM)
+            if self._effect == SCENE_CUSTOM:
+                if SCENE_CUSTOM not in self._effect_list:
+                    self._effect_list.append(SCENE_CUSTOM)
+            elif SCENE_CUSTOM in self._effect_list:
+                self._effect_list.remove(SCENE_CUSTOM)
 
         if self.is_music_mode and supported & LightEntityFeature.EFFECT:
             self._effect = SCENE_MUSIC
